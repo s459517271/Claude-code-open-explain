@@ -207,3 +207,7 @@ src/services/mcp/*
 <p align="center">
   <sub>如果这份文档对你有帮助，欢迎 Star。本仓库会继续把“源码能看见什么”讲得更清楚。</sub>
 </p>
+
+## 友情链接
+
+https://linux.do
