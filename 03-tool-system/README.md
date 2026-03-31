@@ -1,186 +1,251 @@
 # 03 — 工具系统架构
 
-> 40+ 工具的统一注册、调度和执行机制
+> Claude Code 之所以“能做事”，不是因为模型会魔法，而是因为它被接上了一套统一的工具系统
 
-## 核心洞察
+## 先建立一个关键认识
 
-Claude Code 的每个工具都是一个**自包含模块**，定义了：
-- 名称和描述（prompt）
-- 输入 JSON Schema
-- 权限模型
-- 执行逻辑
+在 Claude Code 里，工具不是附属功能，而是产品主体的一部分。
 
-模型在看到工具描述后自行决定调用哪个。Claude Code 不做任何工具路由或选择。
+因为模型本身：
 
-## 工具注册
+- 不能直接读文件
+- 不能直接写代码
+- 不能直接跑 Shell
+- 不能直接访问 MCP 服务器
 
-所有工具在 `src/tools.ts` 中统一注册：
+它只能先输出“我想调用哪个工具、参数是什么”，然后由 Claude Code 代为执行。
 
-```typescript
-// 始终可用的核心工具
-import { BashTool } from './tools/BashTool/BashTool.js'
-import { FileReadTool } from './tools/FileReadTool/FileReadTool.js'
-import { FileWriteTool } from './tools/FileWriteTool/FileWriteTool.js'
-import { FileEditTool } from './tools/FileEditTool/FileEditTool.js'
-import { GlobTool } from './tools/GlobTool/GlobTool.js'
-import { GrepTool } from './tools/GrepTool/GrepTool.js'
-import { AgentTool } from './tools/AgentTool/AgentTool.js'
-import { WebFetchTool } from './tools/WebFetchTool/WebFetchTool.js'
-import { WebSearchTool } from './tools/WebSearchTool/WebSearchTool.js'
+## 本章关键源码入口
 
-// Feature Flag 控制的条件工具
-const SleepTool = feature('PROACTIVE') || feature('KAIROS')
-  ? require('./tools/SleepTool/SleepTool.js').SleepTool
-  : null
-
-const cronTools = feature('AGENT_TRIGGERS')
-  ? [CronCreateTool, CronDeleteTool, CronListTool]
-  : []
-```
-
-**三类工具加载方式：**
-1. **静态导入** — 核心工具，始终可用
-2. **Feature Flag 条件导入** — 未发布功能的工具
-3. **懒加载** — 打破循环依赖（如 TeamCreateTool）
-
-## 工具类型定义
-
-每个工具实现 `Tool` 接口（`src/Tool.ts`）：
-
-```typescript
-interface Tool {
-  name: string                    // 唯一标识符
-  description: string             // 给模型看的描述
-  inputSchema: ToolInputJSONSchema  // JSON Schema
-  
-  // 权限检查
-  isReadOnly(): boolean
-  needsPermission(input: any): boolean
-  
-  // 执行
-  call(input: any, context: ToolUseContext): Promise<ToolResult>
-}
-```
-
-## 完整工具清单
-
-### 核心八件套
-
-| 工具 | 作用 | 权限 |
-|------|------|------|
-| **BashTool** | 执行 shell 命令 | 需确认（危险命令） |
-| **FileReadTool** | 读取文件（支持图片、PDF、notebook） | 只读，自动允许 |
-| **FileWriteTool** | 创建/覆盖文件 | 需确认 |
-| **FileEditTool** | 部分修改文件（字符串替换） | 需确认 |
-| **GlobTool** | 文件模式匹配搜索 | 只读，自动允许 |
-| **GrepTool** | ripgrep 内容搜索 | 只读，自动允许 |
-| **AgentTool** | 生成子 Agent | 自动允许 |
-| **TodoWriteTool** | 任务列表管理 | 自动允许 |
-
-### 扩展工具
-
-| 工具 | 作用 |
+| 文件 | 作用 |
 |------|------|
-| WebFetchTool | 获取 URL 内容 |
-| WebSearchTool | 网页搜索 |
-| SkillTool | 执行技能文件 |
-| MCPTool | 调用 MCP 服务器工具 |
-| LSPTool | 语言服务器集成 |
-| NotebookEditTool | Jupyter Notebook 编辑 |
-| TaskCreateTool | 创建子任务 |
-| TeamCreateTool | 创建 Team Agent |
-| SendMessageTool | Agent 间通信 |
-| EnterWorktreeTool | Git worktree 隔离 |
-| ConfigTool | 设置管理 |
-| AskUserQuestionTool | 向用户提问 |
-| ToolSearchTool | 延迟工具发现 |
+| `src/Tool.ts` | 定义工具契约、工具上下文、工具构建基础能力 |
+| `src/tools.ts` | 统一注册内置工具 |
+| `src/services/tools/*` | 工具执行与调度相关逻辑 |
+| `src/tools/BashTool/*` | 最复杂、最有代表性的工具实现 |
 
-### 隐藏工具（Feature Flag 控制）
+## 一个工具最少要定义什么
 
-| 工具 | Feature Flag | 作用 |
-|------|---|---|
-| SleepTool | PROACTIVE / KAIROS | 主动模式等待 |
-| CronCreateTool | AGENT_TRIGGERS | 定时任务创建 |
-| RemoteTriggerTool | AGENT_TRIGGERS_REMOTE | 远程触发 |
-| MonitorTool | MONITOR_TOOL | 监控工具 |
-| PushNotificationTool | KAIROS | 推送通知 |
-| SendUserFileTool | KAIROS | 向用户发送文件 |
-| SubscribePRTool | KAIROS_GITHUB_WEBHOOKS | PR webhook 订阅 |
-| BriefTool | KAIROS_BRIEF | 简报生成 |
+从源码设计上看，一个工具至少要回答 4 个问题：
 
-## BashTool 深度分析
+1. **我叫什么**：模型如何引用我
+2. **我接收什么参数**：输入 Schema 是什么
+3. **我什么时候能执行**：权限和模式限制是什么
+4. **我执行后返回什么**：结果如何回传给模型
 
-BashTool 是最复杂的工具（15 个文件），因为它面临最大的安全挑战：
+这说明 Claude Code 的工具不是“随便暴露一个函数”，而是一个规范化接口。
 
-```
-src/tools/BashTool/
-├── BashTool.ts              # 主实现
-├── prompt.ts                # 给模型的使用说明
-├── bashPermissions.ts       # 权限判断（2,621 行）
-├── bashSecurity.ts          # 安全检查（2,592 行）
-├── readOnlyValidation.ts    # 只读模式验证（1,990 行）
-├── pathValidation.ts        # 路径验证
-├── commandSemantics.ts      # 命令语义分析
-├── destructiveCommandWarning.ts  # 破坏性命令警告
-├── shouldUseSandbox.ts      # 沙箱判断
-├── sedEditParser.ts         # sed 命令解析
-├── sedValidation.ts         # sed 安全验证
-├── bashCommandHelpers.ts    # 命令辅助函数
-├── modeValidation.ts        # 模式验证
-├── commentLabel.ts          # 注释标签
-└── utils.ts                 # 工具函数
-```
+## `Tool` 契约为什么重要
 
-BashTool 的安全层级：
-1. **命令语义分析** — 解析命令是读取还是写入操作
-2. **路径验证** — 检查操作路径是否在允许范围内
-3. **破坏性命令检测** — `rm -rf`、`git push --force` 等
-4. **只读模式强制** — Plan 模式下禁止写操作
-5. **沙箱隔离** — 可选的文件系统沙箱
+对于模型来说，工具不是代码实现，而是一个“可调用能力描述”。
 
-## 工具描述的 Prompt Engineering
+Claude Code 需要把工具变成模型能理解的形式，所以每个工具都不只是一个 `call()`：
 
-每个工具的描述不只是简单说明，而是精心设计的 prompt。以 FileEditTool 为例：
+- 有名称
+- 有描述
+- 有输入 Schema
+- 有结果格式
+- 有权限语义
+- 有 UI 渲染方式
 
-```typescript
-// 不只说"编辑文件"，而是详细指导模型如何调用
-export const PROMPT = `Performs exact string replacements in files.
+这也是为什么工具系统会单独抽象成 `src/Tool.ts`，而不是散落在各个功能目录里。
 
-Usage:
-- When editing text, ensure you preserve the exact indentation
-- The edit will FAIL if old_string is not unique in the file
-- Use replace_all for replacing and renaming strings across the file
+## `src/tools.ts` 到底在做什么
 
-If you want to create a new file, use the Write tool instead.`
-```
+`src/tools.ts` 是内置工具注册中心。
 
-工具描述实际上承担了**行为引导**的角色 — 告诉模型什么时候该用这个工具、什么时候不该用。
+它负责把各种工具按规则收集起来，例如：
 
-## 设计决策
+- 始终可用的核心工具
+- 由 Feature Flag 控制的实验性工具
+- 用懒加载打破循环依赖的工具
 
-### 为什么没有 RAG？
+这一步非常关键，因为模型看到的并不是“仓库里有哪些工具文件”，而是当前这次会话里最终被注册出来、最终被开放出来的工具集合。
 
-Claude Code 早期用过 Voyage embeddings 做 RAG 检索。后来改成了纯 Agent 式搜索（GlobTool + GrepTool）。
+## 三种常见的工具加载方式
 
-**原因：**
-- Agent 搜索更灵活（可以多次搜索、调整关键词）
-- 不需要维护向量索引
-- 安全性更好（不需要将代码发送到外部嵌入服务）
-- ripgrep 本身就非常快
+### 1. 静态导入
 
-### 为什么工具描述是静态的但 Agent 列表是动态的？
+适合核心能力，例如：
 
-Agent 列表（可用的子 Agent 类型）最初嵌入在 AgentTool 的描述中。但源码注释揭示了问题：
+- `BashTool`
+- `FileReadTool`
+- `FileWriteTool`
+- `FileEditTool`
+- `GlobTool`
+- `GrepTool`
 
-```typescript
-// The dynamic agent list was ~10.2% of fleet cache_creation tokens:
-// MCP async connect, /reload-plugins, or permission-mode changes
-// mutate the list → description changes → full tool-schema cache bust.
-```
+这些能力足够基础，几乎可以视为 Claude Code 的标配。
 
-Agent 列表的变化导致**工具 schema 缓存失效**，消耗了整个平台 10.2% 的 cache 创建 token。解决方案：把 Agent 列表移到消息附件中（`agent_listing_delta`）。
+### 2. Feature Flag 条件导入
+
+源码中很多工具要看 `feature('...')` 是否开启，例如：
+
+- 主动模式相关工具
+- Cron/Trigger 相关工具
+- KAIROS 相关工具
+- 监控、推送、简报类工具
+
+这说明工具系统不仅服务当前产品，也服务未来产品实验。
+
+### 3. 懒加载
+
+有些工具不是因为“不重要”才延迟加载，而是因为：
+
+- 启动时不想拉起太多重量级模块
+- 要规避循环依赖
+
+例如 `TeamCreateTool`、`TeamDeleteTool` 这类和多 Agent 体系耦合更深的工具，就用了懒加载思路。
+
+## 从模型视角看，工具描述本身就是 Prompt
+
+对于模型来说，工具最重要的不是 TypeScript 实现，而是“工具说明文本”。
+
+工具说明会告诉模型：
+
+- 这个工具适合什么时候用
+- 参数该怎么填
+- 有哪些常见失败方式
+- 什么时候不该用它
+
+所以工具描述本质上是一种非常具体的 Prompt Engineering。
+
+### 为什么这很关键
+
+因为 Claude Code 并没有一个独立的工具选择器替模型做路由。模型能不能选对工具，很大程度取决于工具描述写得够不够清楚。
+
+## 工具系统的核心价值，不只是提供能力，还要约束调用
+
+Claude Code 的工具设计不是把能力裸露给模型，而是把能力做成一层有边界的 API。
+
+举个典型例子：
+
+- `FileReadTool` 和 `FileEditTool` 明确分开
+- 读文件和改文件是两个不同权限等级的动作
+- 工具层先把边界切清，权限系统才有可能做细粒度控制
+
+## 核心工具可以先分成哪几类
+
+### 1. 文件与代码操作
+
+- 读取文件
+- 写入文件
+- 精准编辑文件
+- 搜索文件名
+- 搜索文件内容
+- 编辑 Notebook
+- 走 LSP 获取代码诊断与跳转
+
+这是 Claude Code 最核心的一组工具，因为编码任务大多围绕它们展开。
+
+### 2. Shell 执行
+
+`BashTool` 是最重要也最敏感的工具之一。
+
+因为一旦能执行命令，Claude Code 的能力会非常强，但风险也会骤增。所以这类工具的实现通常最厚、最严。
+
+### 3. 网络与外部信息
+
+- `WebFetchTool`
+- `WebSearchTool`
+- 各类 MCP 工具
+
+这组工具让模型不只会看本地代码，还能查外部资料、调用外部系统。
+
+### 4. 协作与编排
+
+- `AgentTool`
+- `TeamCreateTool`
+- `SendMessageTool`
+- `TaskCreateTool`
+- `TodoWriteTool`
+
+这组工具把 Claude Code 从单体 CLI 助手往多 Agent 协作系统推进了一步。
+
+## `BashTool` 为什么是工具系统里最复杂的一类
+
+如果你只能挑一个工具深入看，优先看 `BashTool`。
+
+原因不是它最常用，而是它最能体现 Claude Code 的工程思路：
+
+- 命令语义需要分析
+- 路径需要验证
+- 破坏性动作要识别
+- 只读模式要强约束
+- 沙箱和权限模式都要兼容
+
+换句话说，Claude Code 不是“把 shell 开给模型”，而是“把一层受控 shell 能力开放给模型”。
+
+## 为什么工具系统不能只靠函数签名
+
+如果只是 TypeScript 世界里的函数，接口够用就行。
+
+但 Claude Code 里的工具面对的是模型，所以还必须考虑：
+
+- 描述是否足够清楚
+- 输入是否足够结构化
+- 返回是否足够稳定
+- 权限语义是否足够明确
+- UI 层是否知道怎么展示工具调用过程
+
+这也是为什么工具系统往往会同时涉及：
+
+- 类型系统
+- JSON Schema
+- Prompt 描述
+- 权限控制
+- 渲染逻辑
+
+## Claude Code 为什么没有单独做一个工具规划器
+
+它没有设计一个外部模块去先判断：
+
+- 应该用哪个工具
+- 调用顺序是什么
+- 要不要先搜索再编辑
+
+这些决策大多直接交给模型。
+
+工具系统做的事情是：
+
+- 把能力清晰暴露出来
+- 把边界和说明写清楚
+- 在执行时严格检查
+
+也就是说，Claude Code 选择的是：模型负责决策，工具系统负责提供清晰、稳定、安全的执行接口。
+
+## 动态信息为什么会影响工具体系
+
+工具不只是代码模块，也会进入模型上下文。
+
+这就带来一个重要问题：
+
+- 如果工具描述会跟着环境频繁变化
+- 那模型侧看到的工具 Schema 也会变化
+- 进而影响缓存和稳定性
+
+这也是源码里把某些动态信息从工具描述中迁走的原因，比如动态 agent 列表。
+
+## 新手读工具系统时建议重点抓什么
+
+不要一上来逐个看 40 多个工具。优先抓下面 4 件事：
+
+1. 工具契约怎么定义
+2. 工具是怎么注册进系统的
+3. 工具执行前后有哪些钩子和权限检查
+4. 为什么某些工具需要独立的安全子系统
+
+## 本章小结
+
+工具系统是 Claude Code 的执行层核心，它做的不只是“提供功能”，而是：
+
+- 用统一契约暴露能力
+- 用 Prompt 描述引导模型调用
+- 用 Schema 限制输入形状
+- 用权限系统决定是否执行
+- 用渲染层把工具过程反馈给用户
 
 ## 下一步
 
-- [04 — 权限安全模型](../04-permission-model/) — BashTool 的安全机制详解
-- [07 — 多 Agent 协作](../07-multi-agent/) — AgentTool 如何生成和管理子 Agent
+- [04 — 权限安全模型](../04-permission-model/)：继续看工具调用在真正执行前还要经过哪些检查
+- [07 — 多 Agent 协作](../07-multi-agent/)：继续看 `AgentTool` 与团队工具如何把单体工具系统扩展成多 Agent 系统

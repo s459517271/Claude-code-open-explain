@@ -1,80 +1,215 @@
 # 07 — 多 Agent 协作
 
-> 子 Agent、Team 模式和 Coordinator 的编排架构
+> Claude Code 的并发不是把一个 loop 变复杂，而是把多个独立 agent 组织起来协作
 
-## 核心洞察
+## 为什么这一章值得看
 
-Claude Code 有三层并发机制：
+很多人第一次听到“多 Agent”，脑子里会自动浮现一个问题：
 
-```
-1. AgentTool      → 单个子 Agent（独立上下文，深度=1）
-2. TeamCreateTool → 团队 Agent（多个 Agent 并行工作）
-3. Coordinator    → 协调器模式（Feature Flag 控制，未公开）
-```
+> 是不是让一个模型同时开很多线程做事？
 
-## AgentTool — 子 Agent
+Claude Code 的答案更接近：
 
-子 Agent 是 Claude Code 处理复杂任务的核心手段：
+> 不是把一个代理硬改成并发怪物，而是让多个相对独立的代理各自完成自己的工作，再通过编排层汇总结果。
 
-- 主 Agent 调用 `AgentTool` 生成一个子 Agent
-- 子 Agent 拥有**独立的 QueryEngine 实例和上下文**
-- 子 Agent 完成后，只有**摘要**返回给主 Agent
-- **深度限制**：子 Agent 不能再生子 Agent（depth=1）
+这背后是一种非常清晰的工程取舍。
 
-**为什么要隔离上下文？**
-- 防止工具调用结果污染主对话
-- 子 Agent 可以放心地大量读取文件而不消耗主上下文
-- 失败的子 Agent 不会搞乱主对话历史
+## 本章关键源码入口
 
-## 内置 Agent 类型
+| 文件 | 作用 |
+|------|------|
+| `src/tools/AgentTool/*` | 子 Agent 体系的核心实现 |
+| `src/tools/TeamCreateTool/TeamCreateTool.ts` | 团队创建与多 Agent 编排入口 |
+| `src/tools/AgentTool/builtInAgents.ts` | 内置 agent 列表 |
+| `src/coordinator/coordinatorMode.ts` | 更高层协调模式开关 |
 
-```typescript
-// 探索 Agent — 用于代码库搜索和理解
-const EXPLORE_AGENT = { agentType: 'explore', ... }
+## 先建立一个核心认知
 
-// 验证 Agent — 用于验证修改结果
-const VERIFICATION_AGENT_TYPE = 'verification'
-```
+Claude Code 的多 Agent，不是“一个上下文里塞很多人格”，而是：
 
-## TeamCreateTool — 团队模式
+- 不同 agent 拥有不同职责
+- 很多 agent 有自己独立的上下文
+- 主 agent 最终只接收摘要或结果
 
-当任务可以并行化时：
+这点非常重要，因为它解释了为什么多 Agent 在这里是**上下文隔离工具**，而不只是并行工具。
 
-```
-用户: "同时重构这三个模块"
-  ↓
-主 Agent 调用 TeamCreateTool
-  ↓
-├── Team Agent 1: 重构模块 A
-├── Team Agent 2: 重构模块 B
-└── Team Agent 3: 重构模块 C
-  ↓
-SendMessageTool: Agent 间通信
-  ↓
-结果汇总回主 Agent
-```
+## 最常见的 3 层多 Agent 形态
 
-## Fork 子 Agent（实验性）
+### 1. 单个子 Agent
 
-源码中有 `forkSubagent` 机制 — 子 Agent 可以 fork 主 Agent 的部分上下文：
+这是最基础的形态。主 agent 发现任务太大或太适合拆出去时，会通过 `AgentTool` 生成一个子 agent。
 
-```typescript
-const forkEnabled = isForkSubagentEnabled()
-```
+### 2. 团队模式
 
-这比创建全新的子 Agent 更高效，因为可以共享已有的文件缓存和上下文。
+当任务天然可以拆成多块时，Claude Code 可以通过 `TeamCreateTool` 进入团队协作形态。
 
-## Coordinator 模式
+### 3. 协调器模式
 
-```typescript
-const coordinatorModeModule = feature('COORDINATOR_MODE')
-  ? require('./coordinator/coordinatorMode.js')
-  : null
-```
+源码里还能看到更高层的 `COORDINATOR_MODE`，说明系统还预留了更强的统一调度形态。
 
-Coordinator 模式是最高级的多 Agent 架构，目前通过 Feature Flag 控制，未公开启用。
+## `AgentTool` 解决的核心问题是什么
+
+你可以把 `AgentTool` 理解成“把一个局部任务单独开辟到新工作台”的能力。
+
+它带来的价值主要有 3 个：
+
+### 1. 上下文隔离
+
+子 Agent 可以自己读很多文件、试很多路径，而不用把所有中间噪音都塞回主对话。
+
+### 2. 职责聚焦
+
+某个子 Agent 只做一件事，例如：
+
+- 探索代码库
+- 做计划
+- 验证修改结果
+
+### 3. 主线程减负
+
+主 Agent 不必亲自处理每个细碎步骤，只要接收关键摘要即可。
+
+## Claude Code 里已经有哪些内置 Agent
+
+从 `builtInAgents.ts` 可以看到，源码里至少有这些内置 agent 概念：
+
+- `general-purpose`
+- `statusline-setup`
+- `Explore`
+- `Plan`
+- `claude-code-guide`
+- `verification`
+
+这点很值得注意，因为它说明 Claude Code 并不是只有“一个万能代理”，而是已经开始把不同工作职责模块化。
+
+### 为什么这很重要
+
+因为当 agent 类型被明确命名后，系统才更容易做到：
+
+- 每类 agent 有更明确的使用场景
+- 每类 agent 可以带不同工具集或提示词
+- 不同 agent 的输出格式更可预期
+
+## 团队模式不是“多开几个 agent”这么简单
+
+`TeamCreateTool.ts` 里能看到，它在创建团队时不仅仅是生成几个成员，还会连带处理：
+
+- 团队名
+- 团队文件
+- leader agent id
+- task list 目录
+- 当前 session 与 team 的绑定关系
+
+这说明团队模式在 Claude Code 里已经不是一个临时技巧，而是有状态、有元数据、有生命周期管理的正式能力。
+
+## 为什么多 Agent 要保存团队文件和任务目录
+
+因为多 Agent 一旦进入真实工作流，就不再只是“脑内分工”。
+
+系统需要知道：
+
+- 团队是谁
+- leader 是谁
+- 成员是谁
+- 当前任务怎么分配
+- 会话结束后如何清理
+
+这也是为什么 Team 模式会比单个 `AgentTool` 重得多。  
+它不仅在处理推理分工，也在处理协作状态。
+
+## 多 Agent 最大的收益其实不是“更快”，而是“更稳”
+
+很多人提到多 Agent，第一反应是并行提速。
+
+但从 Claude Code 的实现思路看，另一个更大的收益是：
+
+> 把不同任务的上下文、职责和中间过程拆开，减少相互污染。
+
+例如：
+
+- 一个 agent 专门探索目录结构
+- 一个 agent 专门验证结果
+- 主 agent 只保留高层决策与摘要
+
+这样主上下文会更干净，也更容易持续推进。
+
+## `forkSubagent` 为什么值得关注
+
+源码里还能看到 `forkSubagent` 这类实验性能力。
+
+它反映的不是“又多了一个新花样”，而是一个更细的架构思路：
+
+> 有些时候，不需要从零创建一个全新子 agent，而是可以基于现有上下文做受控分叉。
+
+这说明 Claude Code 的多 Agent 体系正在朝更灵活的上下文复用方向演进。
+
+## 协调器模式说明了什么
+
+`COORDINATOR_MODE` 虽然不是所有用户都能直接看到的公开能力，但它暴露了很重要的产品方向：
+
+- Claude Code 不满足于只有“主 agent + 子 agent”
+- 它在尝试更高层的组织方式
+- 多 Agent 可能不是特例，而会逐步成为更正式的工作范式
+
+这也是为什么读源码时，不应该把多 Agent 看成边角实验。
+
+## 多 Agent 的代价是什么
+
+这一章不能只讲收益，也要看到成本。
+
+引入多 Agent 后，系统要额外解决：
+
+- 上下文隔离与复用边界
+- 结果汇总格式
+- 权限同步
+- 生命周期管理
+- 会话与团队元数据持久化
+
+所以多 Agent 不是免费午餐。Claude Code 的实现方式之所以值得学，就在于它没有把这些复杂度塞回单个 loop，而是单独建了一层编排能力。
+
+## 新手应该怎么理解“什么时候值得用多 Agent”
+
+你可以先记住一个经验判断：
+
+### 适合拆出去
+
+- 探索型任务
+- 验证型任务
+- 天然可并行的多模块任务
+- 会产生大量中间噪音的局部工作
+
+### 不适合强拆
+
+- 严格依赖上一步输出的细链路
+- 本来就很短的线性操作
+- 需要主上下文持续连贯判断的任务
+
+Claude Code 的设计也体现了类似思路：并发是增强能力，不是默认模式。
+
+## 新手常见误区
+
+### 误区 1：多 Agent 就是多线程
+
+不准确。Claude Code 更强调职责拆分、上下文隔离和结果汇总。
+
+### 误区 2：子 Agent 做完后主 Agent 会拥有全部细节
+
+不一定。很多时候主 Agent 只需要摘要和结论，这正是隔离价值所在。
+
+### 误区 3：多 Agent 一定更快
+
+不一定。它也会带来编排成本、同步成本和汇总成本。
+
+## 本章小结
+
+Claude Code 的多 Agent 体系体现出一个很清楚的架构原则：
+
+- 单个 agent loop 尽量保持简单
+- 真正需要拆分时，用新的 agent 承担局部工作
+- 用团队与协调层承接更复杂的协作关系
+- 把并发问题转化成多个独立上下文的组织问题
 
 ## 下一步
 
-- [02 — Agent Loop 核心循环](../02-agentic-loop/) — 子 Agent 共享同样的循环机制
-- [08 — MCP 集成](../08-mcp-integration/) — MCP 工具如何在多 Agent 间共享
+- [02 — Agent Loop 核心循环](../02-agentic-loop/)：回头再看单个 loop，会更理解为什么 Claude Code 不愿意把它做得太并发化
+- [08 — MCP 协议集成](../08-mcp-integration/)：继续看这些 agent 如何共享和调用更广泛的外部能力

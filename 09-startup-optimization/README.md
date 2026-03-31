@@ -1,77 +1,195 @@
 # 09 — 启动性能优化
 
-> 并行预取 + 懒加载 + 死代码消除的组合拳
+> Claude Code 把“CLI 启动快不快”当成一等问题，而不是运行起来以后再说
 
-## 核心洞察
+## 为什么一个命令行工具还要这么在意启动
 
-Claude Code 的启动路径经过精心优化。`main.tsx` 的前 20 行就体现了核心思想：
+因为 Claude Code 不是后台服务，它是高频交互型工具。
 
-```typescript
-// 这些副作用必须在所有其他 import 之前运行：
-// 1. profileCheckpoint 在重量级模块求值之前标记入口
-// 2. startMdmRawRead 启动 MDM 子进程（plutil/reg query），
-//    与下面约 135ms 的 import 并行执行
-// 3. startKeychainPrefetch 并行启动两个 macOS keychain 读取
-//    否则 isRemoteManagedSettingsEligible() 会同步顺序读取
-//    （每次 macOS 启动增加约 65ms）
+只要用户经常：
 
-profileCheckpoint('main_tsx_entry');
-startMdmRawRead();
-startKeychainPrefetch();
-```
+- 打开新终端
+- 切换项目
+- 做短平快的单次调用
+- 频繁进入和退出会话
 
-**关键技巧：** 利用 JavaScript 的 import 求值顺序 — 在 import 语句之间插入副作用调用，让这些异步操作与后续 135ms 的模块加载并行执行。
+启动速度就会直接影响体感。
 
-## 三大优化策略
+所以对 Claude Code 来说，启动阶段的几十毫秒、上百毫秒，不是可以忽略的小数点，而是用户是否愿意持续使用的重要门槛。
 
-### 1. 并行预取
+## 本章关键源码入口
 
-在模块还在加载时就启动 I/O 操作：
-- MDM 设置读取（子进程调用 plutil/reg query）
-- macOS Keychain 读取（OAuth token + API key）
-- GrowthBook Feature Flag 初始化
-- API 预连接
+| 文件 | 作用 |
+|------|------|
+| `src/main.tsx` | 启动入口，也是性能优化最密集的地方 |
+| `src/utils/startupProfiler.ts` | 启动阶段打点 |
+| `src/tools.ts` | 条件导入和工具加载策略 |
+| `src/commands.ts` | 命令侧的 Feature Flag 与惰性装配 |
 
-### 2. 懒加载
+## 新手先记住：启动优化不是只有“少 import”
 
-重量级模块延迟到实际需要时才加载：
-- OpenTelemetry（遥测）
-- gRPC（远程通信）
-- Analytics（分析）
-- Feature Flag 控制的子系统
+Claude Code 的启动优化可以概括成 3 类手段：
 
-```typescript
-// 懒加载打破循环依赖
-const getTeammateUtils = () =>
-  require('./utils/teammate.js') as typeof import('./utils/teammate.js')
-```
+- **尽早并行做 I/O**
+- **尽量延后加载重模块**
+- **在构建时删除根本用不到的代码**
 
-### 3. 死代码消除
+它们分别对应：
 
-Bun 的 `feature()` 函数在构建时求值，未启用的功能代码被完全删除：
+- 并行预取
+- 懒加载
+- Feature Flag 驱动的死代码消除
 
-```typescript
-import { feature } from 'bun:bundle'
+## `main.tsx` 开头为什么那么“奇怪”
 
-// 如果 VOICE_MODE 为 false，整个 require 在构建时被移除
-const voiceCommand = feature('VOICE_MODE')
-  ? require('./commands/voice/index.js').default
-  : null
-```
+如果你打开 `src/main.tsx`，一开始会看到很显眼的注释和顶层副作用调用：
 
-## 启动 Profile
+- 先打 profile checkpoint
+- 先启动 MDM 原始读取
+- 先启动 keychain 预取
 
-源码内置了启动性能追踪：
+这看起来有点反直觉，因为很多工程都会避免顶层副作用。
 
-```typescript
-profileCheckpoint('main_tsx_entry')
-// ... 模块加载 ...
-profileCheckpoint('before_getSystemPrompt')
-// ... prompt 组装 ...
-profileCheckpoint('after_getSystemPrompt')
-```
+但 Claude Code 这里是刻意为之：
+
+> 它想把某些慢 I/O 提前发车，让它们和后续模块加载并行进行。
+
+这是一种非常实用的 CLI 启动优化技巧。
+
+## 并行预取到底在优化什么
+
+并行预取的核心思想不是“更早拿到结果”，而是：
+
+> 不要等所有 import 都结束后，才开始做本来就注定要做的 I/O。
+
+例如：
+
+- 读取 MDM 设置
+- 读取 keychain 里的认证信息
+- 某些配置或远程能力的预判
+
+如果这些动作晚做，就会把本来可以并行摊平的等待时间硬串成一条长链。
+
+## 懒加载不只是为了快，也为了控制复杂度
+
+Claude Code 源码里大量使用 `require(...)` 的惰性加载方式。
+
+这背后通常有两个目的：
+
+### 1. 启动时先别把重量级模块全拉起来
+
+有些功能不是每次启动都立刻用到，例如：
+
+- 某些 Assistant/KAIROS 相关模块
+- 协调器模式
+- 某些高级命令或实验功能
+
+如果一上来全加载，启动成本会被无谓抬高。
+
+### 2. 避免循环依赖
+
+在一个大型 CLI 里，入口、工具、命令、状态、远程能力之间很容易互相引用。  
+惰性加载不仅省时间，也是在拆解初始化时序上的耦合。
+
+## Bun 的 `feature()` 为什么对启动这么重要
+
+Claude Code 大量使用 `feature('FLAG')` 这类写法。
+
+这不只是运行时条件判断，更重要的是：
+
+> 在构建阶段，未启用的分支可以被直接删掉。
+
+这样带来的收益包括：
+
+- 更小的构建体积
+- 更少的模块求值
+- 更低的启动时内存与解析成本
+
+所以 Feature Flag 在 Claude Code 里不仅服务产品灰度，也服务性能工程。
+
+## 启动优化为什么不能只靠“最后测一下”
+
+Claude Code 在启动路径上专门做了 profiler checkpoint，这说明团队并不是凭感觉在优化。
+
+它会关注：
+
+- 哪一段 import 最重
+- 哪个 I/O 可以提前并行
+- 哪些功能值得懒加载
+- 某次改动是否把启动路径又拖慢了
+
+这类工具化意识很重要，因为启动优化最怕“今天快了，明天又慢回去”。
+
+## 为什么 CLI 的启动优化和 Web 首屏优化很像
+
+如果你做过前端，会发现它们的思路很像：
+
+- 都要区分关键路径和非关键路径
+- 都要尽量推迟非必要模块
+- 都要把可以并行的操作尽量并行
+- 都要持续打点，而不是靠主观感觉
+
+区别只是一个发生在浏览器，一个发生在终端。
+
+## Claude Code 为什么能在启动阶段就体现出整体架构水平
+
+因为启动阶段会强迫系统暴露很多真实问题：
+
+- 模块是不是耦合过深
+- 谁依赖谁
+- 哪些能力必须前置
+- 哪些能力其实可以延后
+- 哪些实验功能不该污染核心路径
+
+一个项目如果启动路径写得乱，往往意味着整体边界也不够清楚。
+
+Claude Code 的 `main.tsx` 值得看的地方，正是在于它把这类问题处理得相当有意识。
+
+## 新手可以从这一章学到什么
+
+如果你以后也要做大型 CLI，可以直接借鉴这些原则：
+
+### 1. 启动最先走的路径必须极度克制
+
+不要让次要能力污染主入口。
+
+### 2. I/O 要尽可能并行
+
+能早发车的慢操作就别等。
+
+### 3. 重模块尽量后置
+
+尤其是实验功能、少用功能和大依赖。
+
+### 4. 性能优化需要配合结构优化
+
+如果模块边界一团乱，懒加载和并行化都会很难做。
+
+## 新手常见误区
+
+### 误区 1：CLI 启动慢一点无所谓
+
+不对。高频交互型 CLI 的体感非常依赖启动速度。
+
+### 误区 2：启动优化就是减少几行 import
+
+不对。真正有效的是关键路径梳理、I/O 并行、懒加载和构建期裁剪的组合。
+
+### 误区 3：性能问题后面再测
+
+不对。等架构长歪了再补，成本会高很多。
+
+## 本章小结
+
+Claude Code 的启动优化体现出很成熟的工程意识：
+
+- 把启动阶段当成一级性能场景
+- 用顶层并行预取缩短关键路径
+- 用惰性加载降低初始化负担
+- 用构建期 Feature Flag 做死代码消除
+- 用 profiler 持续量化而不是凭感觉优化
 
 ## 下一步
 
-- [10 — Feature Flag 体系](../10-feature-flags/) — 死代码消除依赖的 Feature Flag 机制
-- [00 — 全局架构概览](../00-overview/) — 启动优化在整体架构中的位置
+- [10 — Feature Flag 体系](../10-feature-flags/)：继续看 `feature()` 为什么既是产品机制，也是性能机制
+- [00 — 全局架构概览](../00-overview/)：回到总图再看，会更能理解为什么入口层的边界这么重要

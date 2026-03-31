@@ -1,185 +1,239 @@
 # 02 — Agent Loop 核心循环
 
-> 一个 AsyncGenerator 驱动的 while 循环，是 Claude Code 的心脏
+> Claude Code 的核心不是“一次回答”，而是一轮又一轮的模型与工具协作
 
-## 核心洞察
+## 先说一个很重要的区别
 
-Claude Code 的核心引擎 `QueryEngine` 只做一件事：
+很多人会把 `QueryEngine.ts` 当成完整循环，其实更准确的说法是：
 
-```
-用户输入 → [组装上下文 → 调 API → 执行工具 → 结果回送]* → 最终响应
-                    ↑_____________________________↓
-                           循环直到没有工具调用
-```
+- `QueryEngine.ts` 负责**组织一轮请求**
+- `query.ts` 负责**执行真正的循环**
 
-实现上，`submitMessage()` 是一个 **AsyncGenerator** — 它通过 `yield` 实时流出每一步的中间状态（文本块、工具调用、状态变更），让 UI 可以实时渲染。
+也就是说，`QueryEngine` 更像导演，`query()` 更像真正上场表演的引擎。
 
-## QueryEngine 类
+## 本章关键源码入口
 
-```typescript
-export class QueryEngine {
-  private config: QueryEngineConfig
-  private mutableMessages: Message[]       // 对话历史（可变）
-  private abortController: AbortController // 中断控制
-  private permissionDenials: SDKPermissionDenial[]
-  private totalUsage: NonNullableUsage     // Token 用量追踪
-  private readFileState: FileStateCache    // 文件状态缓存
-  private discoveredSkillNames = new Set<string>()
+| 文件 | 作用 |
+|------|------|
+| `src/QueryEngine.ts` | 一轮请求的状态管理、参数组装、对外接口 |
+| `src/query.ts` | 模型调用、工具执行、继续/终止判断的核心循环 |
+| `src/utils/queryContext.ts` | 获取 System Prompt、userContext、systemContext |
 
-  async *submitMessage(
-    prompt: string | ContentBlockParam[],
-  ): AsyncGenerator<SDKMessage, void, unknown> {
-    // ... 这就是整个 Agent Loop
-  }
-}
+## 新手先建立一个直觉
+
+Claude Code 的一次回答，通常不是：
+
+```text
+用户提问 -> 模型一次性回答 -> 结束
 ```
 
-**设计选择：** 一个 QueryEngine 实例 = 一个对话。`submitMessage()` 每调用一次 = 一个 turn。状态（消息、文件缓存、用量）跨 turn 持久保存。
+而更像：
 
-## submitMessage 内部流程
-
-```
-submitMessage("帮我修复 bug")
-│
-├── 1. 准备阶段
-│   ├── 清空 skill 追踪（per-turn）
-│   ├── 获取系统 prompt（fetchSystemPromptParts）
-│   ├── 确定模型（用户指定 or 默认）
-│   ├── 确定 thinking 模式（adaptive/disabled）
-│   └── 包装权限检查函数（wrappedCanUseTool）
-│
-├── 2. 进入 query() 循环
-│   │
-│   │  ┌──────── API 调用循环 ────────┐
-│   │  │                              │
-│   │  │  调用 Anthropic Messages API  │
-│   │  │  ↓                            │
-│   │  │  流式接收响应                   │
-│   │  │  ↓                            │
-│   │  │  解析: 文本块 / 工具调用块      │
-│   │  │  ↓                            │
-│   │  │  如果有工具调用:                │
-│   │  │    → 权限检查                  │
-│   │  │    → 执行工具                  │
-│   │  │    → 追加结果到消息历史          │
-│   │  │    → 继续循环                  │
-│   │  │                              │
-│   │  │  如果无工具调用:                │
-│   │  │    → 结束循环                  │
-│   │  │                              │
-│   │  └──────────────────────────────┘
-│   │
-├── 3. 后处理
-│   ├── 更新 usage 统计
-│   ├── 持久化会话
-│   └── yield 最终状态
-│
-└── 返回
+```text
+用户提问
+  ↓
+模型先判断要不要调工具
+  ↓
+如果要，就请求某个工具
+  ↓
+Claude Code 执行工具
+  ↓
+把工具结果再发回模型
+  ↓
+模型基于新结果继续决定下一步
+  ↓
+直到模型认为任务完成
 ```
 
-## 权限检查包装
+这就是 Agent Loop。
 
-一个微妙但重要的设计 — `canUseTool` 被包装了一层来追踪拒绝记录：
+## `QueryEngine` 管的是什么
 
-```typescript
-const wrappedCanUseTool: CanUseToolFn = async (
-  tool, input, toolUseContext, assistantMessage, toolUseID, forceDecision,
-) => {
-  const result = await canUseTool(
-    tool, input, toolUseContext, assistantMessage, toolUseID, forceDecision,
-  )
+从源码看，一个 `QueryEngine` 实例大体对应一段对话会话。
 
-  // 追踪被拒绝的工具调用 → 用于 SDK 报告
-  if (result.behavior !== 'allow') {
-    this.permissionDenials.push({
-      tool_name: sdkCompatToolName(tool.name),
-      tool_use_id: toolUseID,
-      tool_input: input,
-    })
-  }
-  return result
-}
+它会长期持有这些状态：
+
+- 消息历史
+- 中断控制器
+- 权限拒绝记录
+- token 用量
+- 文件读取状态缓存
+- 本轮或本会话发现的技能/工具信息
+
+所以它不是单纯的函数，而是一个**带状态的会话控制器**。
+
+## `submitMessage()` 这一轮做了哪些准备
+
+当用户发来一条消息时，`submitMessage()` 会先做准备工作，再把任务交给 `query()`。
+
+### 它会先决定本轮的运行参数
+
+例如：
+
+- 用哪个模型
+- thinking 是用户强制指定，还是默认 adaptive
+- 本轮有哪些工具可用
+- 这轮请求的 prompt 和上下文是什么
+
+### 它会包装权限检查
+
+源码里有一个非常值得注意的小细节：`canUseTool` 会被包一层，变成 `wrappedCanUseTool`。
+
+这层包装的作用不是改权限逻辑，而是补充记录：
+
+- 哪些工具被拒绝了
+- 对应的 `tool_use_id` 是什么
+- 输入参数是什么
+
+这说明 Claude Code 不只是“问一句允许不允许”，它还在认真记录整轮工具交互的状态。
+
+## 真正的循环在 `query.ts`
+
+如果要用一句话概括 `query.ts`，可以说：
+
+> 它负责把“调用模型”和“执行工具”拼成一个可以持续推进的循环。
+
+### 你可以把它理解成下面这条主链路
+
+```text
+准备好的 messages + prompt + context
+  ↓
+调用模型
+  ↓
+流式收到 assistant 输出
+  ↓
+如果包含 tool_use：
+  - 找到对应工具
+  - 检查权限
+  - 执行工具
+  - 生成 tool_result
+  - 把结果追加回消息历史
+  - 再次调用模型
+  ↓
+如果不再包含 tool_use：
+  - 输出最终文本
+  - 本轮结束
 ```
 
-**为什么要追踪拒绝？** SDK 模式下，外部程序需要知道哪些操作被用户拒绝了，以便做相应处理。
+### 为什么这套 loop 很关键
 
-## Thinking 模式自适应
+因为 Claude Code 的绝大多数聪明行为，都不是 CLI 自己规划出来的，而是模型在每一轮拿到新上下文后临时做的决定。
 
-```typescript
-const initialThinkingConfig: ThinkingConfig = thinkingConfig
-  ? thinkingConfig                          // 用户指定
-  : shouldEnableThinkingByDefault() !== false
-    ? { type: 'adaptive' }                  // 默认: 自适应
-    : { type: 'disabled' }                  // 关闭
-```
+所以这套 loop 的首要任务不是“替模型思考”，而是：
 
-默认使用 `adaptive` thinking — 模型自行决定是否需要 extended thinking，而不是每次都开启（省 token）。
+- 准确传递上下文
+- 正确执行工具
+- 稳定记录状态
+- 在每一轮之间保持一致性
 
-## 模型选择逻辑
+## 为什么 `submitMessage()` 要做成 `AsyncGenerator`
 
-```typescript
-const initialMainLoopModel = userSpecifiedModel
-  ? parseUserSpecifiedModel(userSpecifiedModel)  // 用户通过 --model 指定
-  : getMainLoopModel()                           // 从配置中获取默认模型
-```
+如果只是普通的 `async function`，那调用方只能“等最终结果”。
 
-模型可以在多个层级覆盖：命令行参数 > 环境变量 > 配置文件 > 默认值。
+但 `AsyncGenerator` 的好处是：
 
-## 上下文装配
+- 模型吐出一点文本，就能立刻显示一点
+- 工具开始执行时，UI 可以实时显示
+- 某一步失败时，不需要等整轮结束才知道
+- 用户可以在中途打断
 
-System Prompt 不是唯一的上下文来源。`submitMessage` 还装配了：
+这和终端产品的体验直接相关。对 CLI 来说，“能流出来”比“最后一次性返回”重要得多。
 
-```typescript
-const {
-  defaultSystemPrompt,   // System Prompt 数组
-  userContext,           // 用户上下文（CLAUDE.md、环境等）
-  systemContext,         // 系统上下文（OS、Git 等）
-} = await fetchSystemPromptParts({
-  tools,
-  mainLoopModel: initialMainLoopModel,
-  additionalWorkingDirectories: [...],
-  mcpClients,
-  customSystemPrompt: customPrompt,
-})
-```
+## 这一轮里，上下文是怎么被拼进去的
 
-三种上下文注入方式不同：
-- `defaultSystemPrompt` → API 的 `system` 参数
-- `userContext` → 包装成 XML 标签注入用户消息
-- `systemContext` → 同上
+在 `QueryEngine.ts` 里，本轮请求并不是只拿用户输入去调用模型。
 
-## AsyncGenerator 的妙用
+它会先通过 `fetchSystemPromptParts()` 拿到三类上下文：
 
-为什么用 `async *submitMessage()` 而不是普通 async 函数？
+- `defaultSystemPrompt`
+- `userContext`
+- `systemContext`
 
-```typescript
-// 调用方可以实时消费每一步
-for await (const event of engine.submitMessage("fix the bug")) {
-  if (event.type === 'text') renderText(event.content)
-  if (event.type === 'tool_use') renderToolCall(event)
-  if (event.type === 'result') handleComplete(event)
-}
-```
+这一步很关键，因为 Claude Code 从一开始就不把“上下文”简单理解为聊天记录。它知道不同来源的信息要走不同通道，这样模型才能既有规则，又有环境感知，还能兼顾缓存。
 
-AsyncGenerator 让 UI 可以：
-1. **实时渲染** — 模型输出一个字就显示一个字
-2. **实时显示工具调用** — 用户看到 "正在读取文件..." 而不是干等
-3. **可中断** — 用户随时可以 Ctrl+C
+## 模型与 thinking 模式是怎么决定的
 
-## 关键设计决策
+`submitMessage()` 还会处理两个基础问题：
 
-### 为什么是单线程循环而不是并发执行工具？
+### 1. 本轮用哪个模型
 
-模型在一次响应中可能返回多个工具调用，但 Claude Code 选择**顺序执行**。原因：
-- 工具间可能有依赖（先读文件，再编辑）
-- 顺序执行更容易调试和追踪
-- 错误处理更简单（一个失败不会影响其他）
+大体是：
 
-### 子 Agent 是唯一的并发点
+- 如果用户显式指定模型，就优先用显式值
+- 否则回退到会话或默认模型
 
-需要并发时，通过 `AgentTool` 生成子 Agent — 每个子 Agent 有独立的 QueryEngine 实例和上下文。详见 [07 — 多 Agent 协作](../07-multi-agent/)。
+### 2. 本轮 thinking 怎么开
+
+源码里默认偏向 `adaptive`，意思是：
+
+> 让系统按情况决定是否进入更重的思考模式，而不是每轮都强开。
+
+这本质上是在质量、速度和 token 成本之间做平衡。
+
+## 为什么 Claude Code 选择顺序执行工具
+
+这是很多人读到这里会问的问题：既然模型可能一次返回多个工具调用，为什么不并发跑？
+
+Claude Code 选择了更保守也更稳定的策略：**默认按顺序推进**。
+
+原因很现实：
+
+- 前一个工具结果可能决定后一个工具是否还需要执行
+- 顺序执行更容易让模型保持一致的推理链
+- 出错时更容易定位责任点
+- UI 展示和用户理解成本更低
+
+## 并发是怎么引入的
+
+Claude Code 不是完全不能并发，而是把并发放在更高层：
+
+- 通过 `AgentTool` 生成子 Agent
+- 通过 `TeamCreateTool` 管理多 Agent 协作
+- 由每个子 Agent 各自运行独立 loop
+
+也就是说，单个 loop 保持简单，真正需要并行时，用多个 loop，而不是把一个 loop 改成复杂并发引擎。
+
+## 这一章真正要学会什么
+
+如果你以后要做自己的 Agent CLI，这一章最值得借鉴的是：
+
+### 1. 把会话状态管理和循环执行拆开
+
+`QueryEngine.ts` 与 `query.ts` 的拆分很重要，它让代码职责更清楚。
+
+### 2. 用流式接口贯穿全链路
+
+从模型输出、工具执行到 UI 渲染，都能自然串起来。
+
+### 3. 让循环简单，但让外围信息足够充分
+
+真正复杂的是 prompt、上下文、权限和工具，不是 while 循环本身。
+
+## 新手常见误区
+
+### 误区 1：Agent Loop 就是无限 while
+
+不准确。真正难的是每轮之间怎么维护消息、权限、上下文和错误恢复。
+
+### 误区 2：`QueryEngine` 就等于全部业务逻辑
+
+不对。它是组织者，真正执行循环的核心仍在 `query.ts`。
+
+### 误区 3：实时输出只是 UI 花活
+
+不对。`AsyncGenerator` 是这类交互式 Agent 工具体验的重要基础。
+
+## 本章小结
+
+Claude Code 的 Agent Loop 体现出一个很成熟的产品化思路：
+
+- 主循环保持直接
+- 会话状态独立维护
+- 工具调用串行推进
+- 结果以流式方式暴露给 UI
+- 并发能力通过多 Agent 层引入，而不是污染单 loop
 
 ## 下一步
 
-- [03 — 工具系统架构](../03-tool-system/) — 工具是怎么注册和执行的
-- [05 — 上下文管理与压缩](../05-context-management/) — 循环跑多轮后上下文满了怎么办
+- [03 — 工具系统架构](../03-tool-system/)：继续看模型请求的工具到底是怎么定义和执行的
+- [05 — 上下文管理与压缩](../05-context-management/)：继续看这套循环跑久了以后上下文是怎么管理的

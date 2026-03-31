@@ -1,58 +1,193 @@
 # 08 — MCP 协议集成
 
-> 通过 Model Context Protocol 实现无限工具扩展
+> MCP 让 Claude Code 不再局限于内置工具，而是拥有可持续扩展的外部能力入口
 
-## 核心洞察
+## 为什么这一章重要
 
-MCP（Model Context Protocol）让 Claude Code 的工具集从 40 个内置工具扩展到**无限**。每个 MCP 服务器可以提供：
-- 工具（Tools）
-- 资源（Resources）
-- 提示（Prompts）
+如果没有 MCP，Claude Code 再强，本质上也只是一个内置工具很丰富的 CLI。
 
-## MCP 客户端实现
+有了 MCP 之后，它就从“固定能力集合”变成了“可持续接入外部能力的平台”。
 
-核心实现在 `src/services/mcp/`：
+所以 MCP 在 Claude Code 里不是配件，而是扩展边界的关键机制。
 
-```
-src/services/mcp/
-├── client.ts     # MCP 客户端连接管理（3,348 行）
-├── auth.ts       # MCP 认证（2,465 行）
-├── types.ts      # 类型定义
-└── officialRegistry.ts  # 官方 MCP 服务器注册表
-```
+## 本章关键源码入口
 
-## 连接生命周期
+| 文件 | 作用 |
+|------|------|
+| `src/services/mcp/client.ts` | MCP 客户端核心逻辑 |
+| `src/services/mcp/config.ts` | MCP 配置解析与策略过滤 |
+| `src/services/mcp/types.ts` | MCP 服务器配置类型 |
+| `src/tools/MCPTool/MCPTool.ts` | MCP 工具在统一工具体系里的外壳 |
+| `src/constants/prompts.ts` | MCP 指令如何进入模型上下文 |
 
-```
-1. 启动时读取 MCP 配置（settings.json / .mcp.json）
-2. 建立连接（stdio / HTTP / SSE）
-3. 发现工具（listTools）
-4. 注入工具描述到模型上下文
-5. 模型调用 → MCPTool 路由到对应服务器
-6. 会话结束时断开连接
-```
+## 先用新手能懂的话说：MCP 到底解决什么问题
 
-## MCPTool 路由
+Claude Code 的内置工具再多，也不可能提前内建所有能力。
 
-当模型调用一个 MCP 工具时，`MCPTool` 负责路由：
+例如你可能还想让它接入：
 
-```
-模型调用: mcp_server_name__tool_name(args)
-  ↓
-MCPTool 解析服务器名和工具名
-  ↓
-转发到对应 MCP 服务器
-  ↓
-返回结果给模型
-```
+- GitHub
+- 数据库
+- 浏览器
+- 设计工具
+- 内部服务
+- 企业知识系统
 
-## MCP 指令与 Prompt Cache
+MCP 的作用就是：
 
-MCP 服务器可以提供 `instructions`，这些指令需要注入到 system prompt 中。但 MCP 服务器可能在对话中途连接/断开，导致 prompt cache 失效。
+> 用统一协议把这些外部能力接进 Claude Code，让模型像调用内置工具一样调用它们。
 
-解决方案：`mcp_instructions_delta` — 把 MCP 指令作为消息附件而非 system prompt 的一部分。
+## MCP 在 Claude Code 里不只是一种“远程调用”
+
+从源码来看，Claude Code 通过 MCP 接入的不只是工具，还可能涉及：
+
+- Tools
+- Resources
+- Instructions
+- 某些和命令或技能索引相关的扩展信息
+
+这说明 MCP 在 Claude Code 里的角色，不只是“RPC 插件系统”，而是更接近“外部能力总线”。
+
+## `MCPTool` 为什么看起来像个空壳
+
+如果你去看 `src/tools/MCPTool/MCPTool.ts`，会发现一个很有意思的现象：
+
+- 名称是占位的
+- 描述是占位的
+- `call()` 也是占位的
+
+这说明什么？
+
+说明 `MCPTool` 并不是具体某个 MCP 工具本身，而是：
+
+> MCP 工具接入 Claude Code 统一工具体系时使用的通用外壳。
+
+真正的服务器名、工具名、参数和执行逻辑，会在更高层的 MCP 客户端逻辑里被补齐和路由。
+
+## Claude Code 支持哪些 MCP 连接类型
+
+从 `src/services/mcp/types.ts` 和相关工具函数可以看到，MCP 连接类型比很多入门资料写得更丰富。
+
+常见类型包括：
+
+- `stdio`
+- `sse`
+- `http`
+- `ws`
+- `sdk`
+
+某些 IDE 相关场景下还会出现更细的变体。
+
+这说明 Claude Code 的 MCP 体系并不是只为一种部署方式设计，而是从一开始就在兼容：
+
+- 本地进程型 MCP
+- 远程服务型 MCP
+- 更深度集成到 SDK 或 IDE 的 MCP
+
+## MCP 接入不是“配上地址就完了”
+
+Claude Code 在 MCP 上做了很多产品级处理，例如：
+
+- 配置解析
+- 企业策略过滤
+- 认证处理
+- 重连管理
+- 动态头生成
+- 工具名与服务器名归一化
+
+所以源码里的 MCP 目录会很厚，这不是过度设计，而是因为真实世界里的外部连接本来就复杂。
+
+## 为什么 MCP 配置还要经过策略过滤
+
+从 `config.ts` 可以看到，Claude Code 会对 MCP 服务器配置做 allowlist / denylist 级别的过滤。
+
+这件事非常重要，因为 MCP 不只是“扩展能力”，它也是新的风险入口：
+
+- 可以带来新工具
+- 可以带来新资源
+- 可能需要执行本地命令
+- 可能需要连接远程服务
+
+所以 MCP 不是接进来就算完，而是要先判断“这台服务器是否允许存在”。
+
+## 认证为什么会成为 MCP 体系的大头
+
+从 `auth.ts` 可以看出，Claude Code 对 MCP 认证投入了很多代码量。
+
+这背后的现实原因是：
+
+- 远程 MCP 常常需要 OAuth
+- 令牌可能过期
+- 不同服务的认证细节并不一致
+- 企业环境往往还有额外要求
+
+也就是说，MCP 真正难的地方从来不只是“调用 tool”，而是“把一个外部系统可靠地接进来并长期维持可用”。
+
+## MCP 为什么会影响 Prompt Cache
+
+这也是 Claude Code 很有代表性的工程细节。
+
+很多 MCP 服务器会自带 `instructions`。这些指令如果直接进 System Prompt，会带来一个问题：
+
+- MCP 服务器是动态的
+- 连接状态会变化
+- 服务器提供的指令也可能变化
+
+一旦这些变化进入稳定 prompt 前缀，就会破坏缓存稳定性。
+
+所以源码里会特别强调：
+
+- `mcp_instructions` 是高波动内容
+- 更好的做法是转成 `mcp_instructions_delta` 这类消息级机制
+
+这说明 MCP 集成不是单独一个目录的事情，它还会反向影响 Prompt 与 Cache 架构。
+
+## MCP 结果为什么还要考虑大输出处理
+
+从 `client.ts` 的实现可以看出来，Claude Code 还会处理这样的问题：
+
+- MCP 返回内容太长怎么办
+- 是否需要持久化到文件再提示读取
+- 图片或特殊内容如何传递
+
+这说明它不是只关心“请求发出去有没有回”，还关心：
+
+> 回来的内容能不能以模型和用户都可承受的方式继续进入下一轮。
+
+## 为什么说 MCP 让 Claude Code 变成平台
+
+有了 MCP 以后，Claude Code 的能力边界不再由“内置多少工具”决定，而是由：
+
+- 你接入了哪些 MCP 服务器
+- 这些服务器提供了哪些工具与资源
+- 权限与策略允许接入到什么程度
+
+这就是平台型系统和单体工具的本质差别。
+
+## 新手常见误区
+
+### 误区 1：MCP 就是插件
+
+不完全对。插件是实现形态之一，但在 Claude Code 里，MCP 更像统一扩展协议。
+
+### 误区 2：MCP 只是工具调用转发
+
+不对。它还涉及资源、指令、认证、连接管理和策略过滤。
+
+### 误区 3：外部能力越多越好
+
+不对。MCP 带来扩展性的同时，也带来缓存、安全、权限和可靠性成本。
+
+## 本章小结
+
+Claude Code 的 MCP 体系说明了一个成熟产品的扩展思路：
+
+- 用统一协议接入外部能力
+- 用统一工具体系向模型暴露这些能力
+- 用策略、认证和连接管理兜住现实复杂度
+- 用 Prompt/Cache 层配合处理高波动信息
 
 ## 下一步
 
-- [03 — 工具系统架构](../03-tool-system/) — MCP 工具如何与内置工具统一管理
-- [06 — Prompt Cache 优化](../06-prompt-caching/) — MCP 对缓存的影响和解决方案
+- [03 — 工具系统架构](../03-tool-system/)：回头再看工具层，会更理解为什么 MCP 工具必须被统一包装
+- [06 — Prompt Cache 优化](../06-prompt-caching/)：继续看高波动 MCP 指令为什么必须被挪出稳定前缀
